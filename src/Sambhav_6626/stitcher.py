@@ -38,8 +38,9 @@ class PanaromaStitcher():
         H_chain_final = self.compute_homography_chains(H_final_list, num_images)
         # Step 4: Stitch images to form panorama
         stitched_image = self.stitch_images(images, H_chain_final)
+        cropped_image = self.crop_black_border(stitched_image)
         
-        return stitched_image, final_Homography
+        return cropped_image, final_Homography
         # Collect all homographies calculated for pair of images and return
         # homography_matrix_list =[]
         # # Return Final panaroma
@@ -334,6 +335,19 @@ class PanaromaStitcher():
             pan_img = self.getPanoramicImage(pan_img, images[i], H_normalized, min_xy_coord)
 
         return pan_img
+    def crop_black_border(self, img):
+      # Detect non-black pixels
+      gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # Convert to grayscale
+      non_black_pixels = np.where(gray > 0)  # Get indices of non-black pixels
+
+      # Find the bounding box of non-black pixels
+      min_y, max_y = np.min(non_black_pixels[0]), np.max(non_black_pixels[0])
+      min_x, max_x = np.min(non_black_pixels[1]), np.max(non_black_pixels[1])
+
+      # Crop the image based on the bounding box
+      cropped_img = img[min_y:max_y + 1, min_x:max_x + 1]
+
+      return cropped_img
    
 
 
