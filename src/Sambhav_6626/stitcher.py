@@ -72,7 +72,7 @@ class PanaromaStitcher():
             des2 = descriptors_list[i + 1]
             matches = self.bf.knnMatch(des1, des2, k=2)
 
-            good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+            good_matches = [m for m, n in matches if m.distance < 0.5 * n.distance]
 
             img1_pts = np.float32([keypoints_list[i][m.queryIdx].pt for m in good_matches])
             img2_pts = np.float32([keypoints_list[i + 1][m.trainIdx].pt for m in good_matches])
@@ -176,14 +176,18 @@ class PanaromaStitcher():
         max_inliers_list = []
         G_best_list = []
         H_final_list = []  # Store the final refined homographies
-        
+        w=0.28
+        p=0.99
+        s=4
+        N=np.log10(1-p)/np.log10(1-(w**s))
+        N=int(N)
         for idx in range(len(images) - 1):
             max_inliers = 0
             G_best = None
             transformed_test_1 = self.apply_transformation(all_img1_pts[idx], transformation_matrices[idx][0])
             transformed_test_12 = self.apply_transformation(all_img2_pts[idx], transformation_matrices[idx][1])
 
-            for _ in range(800):  # RANSAC iterations
+            for _ in range(N):  # RANSAC iterations
                 selected_1, selected_2 = self.select_random_points(transformed_test_1, transformed_test_12)
                 H = self.compute_homography_matrix(selected_1, selected_2)
                 # print("g")
@@ -282,17 +286,65 @@ class PanaromaStitcher():
             img_corners_range[:,i] = img_corners_range[:,i]/img_corners_range[-1,i]
     
         return img_corners_range[0:2,:]
-    def getPanoramicImage(self,range_img,domain_img,H,offsetXY):
-            H_inv = np.linalg.inv(H)
-            for i in range(0,range_img.shape[0]): #Y-coordinate, row
-                for j in range(0,range_img.shape[1]): #X-coordinate, col
-                        X_domain = np.array([j+offsetXY[0],i+offsetXY[1], 1])
-                        X_range = np.array(np.matmul(H_inv,X_domain))
-                        X_range = X_range/X_range[-1]
+    def create_distance_weight_mask(self,shape):
+        """Create a weight mask where pixels closer to center have higher weights, with added Gaussian blur."""
+        height, width = shape[:2]
+        y, x = np.ogrid[:height, :width]
         
-                        if (X_range[0]>0 and X_range[1]>0 and X_range[0]<domain_img.shape[1]-1 and X_range[1]<domain_img.shape[0]-1):
-                                range_img[i][j] = self.BilinearInterpforPixelValue(domain_img,X_range)
-            return range_img
+        # Calculate distance from each edge
+        dist_left = x.reshape(-1, width)
+        dist_right = (width - x).reshape(-1, width)
+        dist_top = y.reshape(height, -1)
+        dist_bottom = (height - y).reshape(height, -1)
+        
+        # Stack all distances and find minimum
+        dist_to_edge = np.minimum(np.minimum(dist_left, dist_right), 
+                                  np.minimum(dist_top, dist_bottom))
+        
+        # Normalize weights to [0, 1]
+        weights = dist_to_edge / dist_to_edge.max()
+        
+        # Apply Gaussian blur to smooth edges (hardcoded parameters)
+        weights = cv2.GaussianBlur(weights, (21, 21), 10)
+    
+        # Ensure same shape as input image
+        weights = weights.reshape(height, width)
+        
+        # Add extra dimension if input image has channels
+        if len(shape) == 3:
+            weights = weights[..., np.newaxis]
+            weights = np.repeat(weights, shape[2], axis=2)
+        return weights.astype(np.float32)
+    def getPanoramicImage(self,range_img, domain_img, H, offsetXY):
+        H_inv = np.linalg.inv(H)
+        # Create weight mask for domain image with smoothing
+        domain_weights = self.create_distance_weight_mask(domain_img.shape)
+        
+        for i in range(0, range_img.shape[0]):  # Y-coordinate, row
+            for j in range(0, range_img.shape[1]):  # X-coordinate, col
+                X_domain = np.array([j + offsetXY[0], i + offsetXY[1], 1])
+                X_range = np.array(np.matmul(H_inv, X_domain))
+                X_range = X_range / X_range[-1]
+    
+                if (X_range[0] > 0 and X_range[1] > 0 and X_range[0] < domain_img.shape[1] - 1 and X_range[1] < domain_img.shape[0] - 1):
+                    # Get pixel value using bilinear interpolation
+                    new_pixel = self.BilinearInterpforPixelValue(domain_img, X_range)
+                    
+                    # Get weight for this pixel from domain image
+                    weight = self.BilinearInterpforPixelValue(domain_weights, X_range)
+                    
+                    # Adjust weight for smoother blending
+                    weight *= 0.5  # Hardcoded blend strength
+                    
+                    # If there's already a value in the range image, blend based on weights
+                    if np.any(range_img[i][j]):
+                        existing_weight = 1 - weight  # Weight for existing pixel
+                        range_img[i][j] = (range_img[i][j] * existing_weight + new_pixel * weight) / (existing_weight + weight)
+                    else:
+                        range_img[i][j] = new_pixel
+                    
+        return range_img
+
     def compute_homography_chains(self,H_final_list, num_images):
         ref_idx = num_images // 2
         H_chain_final = []
@@ -325,9 +377,11 @@ class PanaromaStitcher():
         min_xy_coord = np.amin(np.amin(corners_list, axis=2), axis=0)
         max_xy_coord = np.amax(np.amax(corners_list, axis=2), axis=0)
         final_img_dim = max_xy_coord - min_xy_coord
-
+        j = int(final_img_dim[1]*1.5)
+        k = int(final_img_dim[0]*1.5)
+        pan_img = np.zeros((j, k, 3), dtype=np.uint8)
         # Initialize the panorama canvas with computed dimensions
-        pan_img = np.zeros((int(final_img_dim[1]), int(final_img_dim[0]), 3), dtype=np.uint8)
+        # pan_img = np.zeros((int(final_img_dim[0]), int(final_img_dim[1]), 3), dtype=np.uint8)
 
         # Warp each image and place it on the panoramic canvas
         for i in range(len(images)):
